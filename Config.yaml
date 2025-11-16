@@ -1,10 +1,10 @@
-# config.yaml — Super Saiyan Control Panel
-backend: "resemblyzer"      # "resemblyzer" or "mfcc"
-storage: "json"             # "json" or "sqlite"
+# config.yaml — Torch-Free Super Saiyan
+backend: "mfcc"              # "mfcc" only (no torch)
+storage: "json"              # "json" or "sqlite"
 threshold: 0.8
 duration: 3.0
 sample_rate: 16000
 require_liveness: true
-liveness_phrase: "random"   # "random" or fixed
+liveness_phrase: "random"
 default_user: "lyle"
 max_users: 1000
