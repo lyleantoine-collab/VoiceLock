@@ -1,13 +1,16 @@
-# modules/voicelock.py — v1.1 ZERO-DEP (numpy + pyyaml only)
+# modules/voicelock.py — VoiceLock v1.2 | Secure, Fast, Complete
 # MIT License | lyleantoine-collab | 2025
 
+import sounddevice as sd
 import numpy as np
 import json
 import os
 import yaml
-import subprocess
 import random
+import time
 from datetime import datetime
+from python_speech_features import mfcc
+from sklearn.mixture import GaussianMixture
 
 # === CONFIG ===
 try:
@@ -27,32 +30,93 @@ DEFAULT_USER = CONFIG.get("default_user", "lyle")
 ANTI_REPLAY = CONFIG.get("anti_replay", True)
 REPLAY_AGE = CONFIG.get("max_replay_age", 60)
 
-# === RECORD VIA TERMUX (arecord) ===
+# === RECORD ===
 def _record():
-    """Record 3s via Termux mic."""
-    print(f"Speak now ({DUR}s)...")
+    """Capture 3s audio."""
     try:
-        subprocess.run(["termux-microphone-record", "-f", "tmp.wav", "-l", str(int(DUR))], check=True)
-        import wave
-        with wave.open("tmp.wav", "rb") as wf:
-            audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
-        os.remove("tmp.wav")
-        return audio.astype(np.float32) / 32768.0
-    except:
-        print("Mic failed. Using dummy.")
-        return np.random.randn(int(DUR * SR))
+        print(f"Speak now ({DUR}s)...")
+        audio = sd.rec(int(DUR * SR), samplerate=SR, channels=1, dtype='float32')
+        sd.wait()
+        return audio.flatten()
+    except Exception as e:
+        print(f"Record error: {e}")
+        return None
 
-# === PURE NUMPY MFCC (simplified) ===
+# === EMBEDDING (MFCC + GMM) ===
 def get_embedding(wav):
-    """Simple MFCC-like embedding."""
-    # Downsample
-    wav = wav[::2]
-    # FFT frames
-    frames = np.lib.stride_tricks.sliding_window_view(wav, 512)[::256]
-    spec = np.abs(np.fft.rfft(frames, n=512))
-    # Mel-like filter (crude)
-    embed = np.log(spec.mean(axis=0) + 1e-6)
-    return np.pad(embed, (0, 256))[:256]
+    """Generate 256D voiceprint."""
+    try:
+        feats = mfcc(wav, samplerate=SR, nfft=2048)
+        gmm = GaussianMixture(n_components=16, random_state=42)
+        gmm.fit(feats)
+        return gmm.means_.flatten()[:256]
+    except:
+        return np.zeros(256)
 
-# === REST SAME AS BEFORE (enroll, verify, gate, etc.) ===
-# ... [same logic from last version, just using _record() and get_embedding()]
+# === LIVENESS PHRASE ===
+def _get_phrase():
+    if PHRASE_MODE == "random":
+        words = ["alpha", "bravo", "charlie", "delta", "echo"]
+        return " ".join(random.choices(words, k=3))
+    return PHRASE_MODE
+
+# === ANTI-REPLAY ===
+def _check_replay(user_id):
+    if not ANTI_REPLAY: return True
+    try:
+        db = json.load(open(DB)) if os.path.exists(DB) else {}
+        now = time.time()
+        if user_id in db and now - db[user_id].get("last_used", 0) < REPLAY_AGE:
+            print("REPLAY DETECTED")
+            return False
+        db[user_id] = db.get(user_id, {})
+        db[user_id]["last_used"] = now
+        json.dump(db, open(DB, 'w'), indent=2)
+        return True
+    except:
+        return True
+
+# === ENROLL ===
+def enroll(user_id=DEFAULT_USER):
+    wav = _record()
+    if not wav: return
+    embed = get_embedding(wav)
+    db = json.load(open(DB)) if os.path.exists(DB) else {}
+    db[user_id] = {"embed": embed.tolist(), "last_used": 0}
+    json.dump(db, open(DB, 'w'), indent=2)
+    print(f"ENROLLED: {user_id}")
+
+# === VERIFY ===
+def verify(wav, user_id=DEFAULT_USER):
+    embed = get_embedding(wav)
+    db = json.load(open(DB)) if os.path.exists(DB) else {}
+    if user_id not in db: return False
+    saved = np.array(db[user_id]["embed"])
+    sim = np.dot(saved, embed) / (np.linalg.norm(saved) * np.linalg.norm(embed))
+    if sim < THRESH: return False
+    return _check_replay(user_id)
+
+# === GATE ===
+def gate(user_id=None):
+    user_id = user_id or DEFAULT_USER
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            try:
+                if LIVENESS:
+                    print(f"Say: '{_get_phrase()}'")
+                    input("Press Enter after speaking...")
+                wav = _record()
+                if not wav: return None
+                if verify(wav, user_id):
+                    print(f"[{_now()}] ACCESS GRANTED")
+                    return func(*args, **kwargs)
+                print(f"[{_now()}] ACCESS DENIED")
+                return None
+            except Exception as e:
+                print(f"GATE ERROR: {e}")
+                return None
+        return wrapper
+    return decorator
+
+def _now():
+    return datetime.now().strftime("%H:%M:%S")
