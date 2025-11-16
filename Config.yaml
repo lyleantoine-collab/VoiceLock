@@ -1,7 +1,10 @@
-# config.yaml — VoiceLock Settings
-default_user: "lyle"
+# config.yaml — Super Saiyan Control Panel
+backend: "resemblyzer"      # "resemblyzer" or "mfcc"
+storage: "json"             # "json" or "sqlite"
 threshold: 0.8
 duration: 3.0
 sample_rate: 16000
-require_phrase: true
-phrase: "lyle authorize"
+require_liveness: true
+liveness_phrase: "random"   # "random" or fixed
+default_user: "lyle"
+max_users: 1000
