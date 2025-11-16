@@ -1,74 +1,129 @@
-# modules/voicelock.py — Universal Voice Biometric Gate
-# MIT License | lyleantoine-collab | v0.2
-# Full overwrite — safe, clean, ready for AI integration
+# modules/voicelock.py — Super Saiyan VoiceLock v1.0
+# MIT License | lyleantoine-collab | 2025
 
 import sounddevice as sd
 import numpy as np
 import json
 import os
 import yaml
+import sqlite3
+import time
+import random
 from datetime import datetime
-from resemblyzer import VoiceEncoder, preprocess_wav
 
 # === LOAD CONFIG ===
-try:
-    with open("config.yaml", "r") as f:
-        CONFIG = yaml.safe_load(f)
-except FileNotFoundError:
-    print("config.yaml not found. Using defaults.")
-    CONFIG = {}
+with open("config.yaml", "r") as f:
+    CONFIG = yaml.safe_load(f)
 
-# === DEFAULTS (from config or fallback) ===
-DB = "voicelock_db.json"
+# === CONFIG VARS ===
+BACKEND = CONFIG.get("backend", "resemblyzer")
+STORAGE = CONFIG.get("storage", "json")
+DB_JSON = "voicelock_db.json"
+DB_SQLITE = "voicelock.db"
+THRESH = CONFIG.get("threshold", 0.8)
 DUR = CONFIG.get("duration", 3.0)
 SR = CONFIG.get("sample_rate", 16000)
-THRESH = CONFIG.get("threshold", 0.8)
-REQ_PHRASE = CONFIG.get("require_phrase", False)
-PHRASE = CONFIG.get("phrase", "lyle authorize")
+LIVENESS = CONFIG.get("require_liveness", True)
+PHRASE_MODE = CONFIG.get("liveness_phrase", "random")
 DEFAULT_USER = CONFIG.get("default_user", "lyle")
 
-# === ENCODER ===
-encoder = VoiceEncoder()
+# === BACKEND: RESEMBLIZER ===
+if BACKEND == "resemblyzer":
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    encoder = VoiceEncoder()
+    def get_embedding(wav):
+        return encoder.embed_utterance(wav)
 
-# === RECORD & PREPROCESS ===
+# === BACKEND: MFCC + GMM ===
+elif BACKEND == "mfcc":
+    from python_speech_features import mfcc
+    from sklearn.mixture import GaussianMixture
+    def get_embedding(wav):
+        mfcc_feat = mfcc(wav, SR)
+        gmm = GaussianMixture(n_components=16)
+        gmm.fit(mfcc_feat)
+        return gmm.means_.flatten()[:256]  # Pad/truncate to 256D
+
+# === STORAGE: JSON ===
+def _load_json():
+    return {} if not os.path.exists(DB_JSON) else json.load(open(DB_JSON))
+
+def _save_json(db):
+    json.dump(db, open(DB_JSON, 'w'), indent=2)
+
+# === STORAGE: SQLITE ===
+def _init_sqlite():
+    conn = sqlite3.connect(DB_SQLITE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            embedding BLOB,
+            enrolled_at TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+# === RECORD ===
 def _record():
     print(f"Speak now ({DUR}s)...")
     audio = sd.rec(int(DUR * SR), samplerate=SR, channels=1, dtype='float32')
     sd.wait()
-    return preprocess_wav(audio.flatten())
+    return audio.flatten()
 
-# === ENROLL USER ===
+# === LIVENESS PHRASE ===
+def _get_phrase():
+    if PHRASE_MODE == "random":
+        words = ["alpha", "bravo", "charlie", "delta", "echo"]
+        return " ".join(random.choices(words, k=3))
+    return PHRASE_MODE
+
+# === ENROLL ===
 def enroll(user_id=DEFAULT_USER):
     wav = _record()
-    embed = encoder.embed_utterance(wav)
-    db = {} if not os.path.exists(DB) else json.load(open(DB))
-    db[user_id] = embed.tolist()
-    json.dump(db, open(DB, 'w'), indent=2)
+    embed = get_embedding(wav).tolist()
+    timestamp = datetime.now().isoformat()
+    
+    if STORAGE == "json":
+        db = _load_json()
+        db[user_id] = {"embed": embed, "enrolled": timestamp}
+        _save_json(db)
+    else:
+        conn = _init_sqlite()
+        conn.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?)",
+                     (user_id, json.dumps(embed), timestamp))
+        conn.commit()
+        conn.close()
     print(f"ENROLLED: {user_id}")
 
-# === VERIFY USER ===
+# === VERIFY ===
 def verify(wav, user_id=DEFAULT_USER):
-    if not os.path.exists(DB):
-        return False
-    db = json.load(open(DB))
-    if user_id not in db:
-        return False
-    saved = np.array(db[user_id])
-    current = encoder.embed_utterance(wav)
-    sim = np.dot(saved, current) / (np.linalg.norm(saved) * np.linalg.norm(current))
+    embed = get_embedding(wav)
+    if STORAGE == "json":
+        db = _load_json()
+        if user_id not in db: return False
+        saved = np.array(json.loads(json.dumps(db[user_id]["embed"])))
+    else:
+        conn = sqlite3.connect(DB_SQLITE)
+        cur = conn.execute("SELECT embedding FROM users WHERE id=?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row: return False
+        saved = np.array(json.loads(row[0]))
+    
+    sim = np.dot(saved, embed) / (np.linalg.norm(saved) * np.linalg.norm(embed))
     return sim > THRESH
 
-# === GATE DECORATOR ===
+# === GATE ===
 def gate(user_id=None):
     user_id = user_id or DEFAULT_USER
     def decorator(func):
         def wrapper(*args, **kwargs):
+            phrase = _get_phrase() if LIVENESS else None
+            if LIVENESS:
+                print(f"Say: '{phrase}'")
+                input()  # Wait for user
             wav = _record()
-            if REQ_PHRASE:
-                said = input(f"Say: '{PHRASE}': ").strip().lower()
-                if said != PHRASE.lower():
-                    print("PHRASE DENIED")
-                    return None
             if verify(wav, user_id):
                 print(f"[{_now()}] ACCESS GRANTED: {user_id}")
                 return func(*args, **kwargs)
@@ -79,26 +134,31 @@ def gate(user_id=None):
 
 # === MULTI-USER TOOLS ===
 def list_users():
-    if not os.path.exists(DB):
-        print("No users enrolled.")
-        return []
-    db = json.load(open(DB))
-    users = list(db.keys())
-    print(f"Users: {', '.join(users)}")
-    return users
+    if STORAGE == "json":
+        db = _load_json()
+        print(f"Users: {', '.join(db.keys())}")
+        return list(db.keys())
+    else:
+        conn = sqlite3.connect(DB_SQLITE)
+        cur = conn.execute("SELECT id FROM users")
+        users = [row[0] for row in cur.fetchall()]
+        conn.close()
+        print(f"Users: {', '.join(users)}")
+        return users
 
 def delete_user(user_id):
-    if not os.path.exists(DB):
-        print("No DB.")
-        return
-    db = json.load(open(DB))
-    if user_id in db:
-        del db[user_id]
-        json.dump(db, open(DB, 'w'), indent=2)
-        print(f"DELETED: {user_id}")
+    if STORAGE == "json":
+        db = _load_json()
+        if user_id in db:
+            del db[user_id]
+            _save_json(db)
+            print(f"DELETED: {user_id}")
     else:
-        print("User not found.")
+        conn = sqlite3.connect(DB_SQLITE)
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit()
+        conn.close()
+        print(f"DELETED: {user_id}")
 
-# === INTERNAL ===
 def _now():
     return datetime.now().strftime("%H:%M:%S")
