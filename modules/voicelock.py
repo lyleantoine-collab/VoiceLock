@@ -1,70 +1,104 @@
-# voicelock.py — Universal Voice Biometric Gate
-# MIT License | Indigenous-Led | Plug into ANY AI
-# Repo: github.com/lyleantoine-collab/VoiceLock
+# modules/voicelock.py — Universal Voice Biometric Gate
+# MIT License | lyleantoine-collab | v0.2
+# Full overwrite — safe, clean, ready for AI integration
 
 import sounddevice as sd
 import numpy as np
-import hashlib
 import json
 import os
+import yaml
 from datetime import datetime
+from resemblyzer import VoiceEncoder, preprocess_wav
 
-# === CONFIG ===
-DB_PATH = os.path.expanduser("~/VoiceLock/voicelock_db.json")
-DURATION = 2.0
-SAMPLE_RATE = 44100
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# === LOAD CONFIG ===
+try:
+    with open("config.yaml", "r") as f:
+        CONFIG = yaml.safe_load(f)
+except FileNotFoundError:
+    print("config.yaml not found. Using defaults.")
+    CONFIG = {}
+
+# === DEFAULTS (from config or fallback) ===
+DB = "voicelock_db.json"
+DUR = CONFIG.get("duration", 3.0)
+SR = CONFIG.get("sample_rate", 16000)
+THRESH = CONFIG.get("threshold", 0.8)
+REQ_PHRASE = CONFIG.get("require_phrase", False)
+PHRASE = CONFIG.get("phrase", "lyle authorize")
+DEFAULT_USER = CONFIG.get("default_user", "lyle")
+
+# === ENCODER ===
+encoder = VoiceEncoder()
+
+# === RECORD & PREPROCESS ===
+def _record():
+    print(f"Speak now ({DUR}s)...")
+    audio = sd.rec(int(DUR * SR), samplerate=SR, channels=1, dtype='float32')
+    sd.wait()
+    return preprocess_wav(audio.flatten())
 
 # === ENROLL USER ===
-def enroll(user_id="lyle"):
-    print(f"[{_now()}] ENROLLING: {user_id.upper()}")
-    audio = _record()
-    fingerprint = _fingerprint(audio)
-    db = _load_db()
-    db[user_id] = fingerprint
-    _save_db(db)
-    print(f"VOICEPRINT LOCKED: {user_id}")
+def enroll(user_id=DEFAULT_USER):
+    wav = _record()
+    embed = encoder.embed_utterance(wav)
+    db = {} if not os.path.exists(DB) else json.load(open(DB))
+    db[user_id] = embed.tolist()
+    json.dump(db, open(DB, 'w'), indent=2)
+    print(f"ENROLLED: {user_id}")
 
 # === VERIFY USER ===
-def verify(audio, user_id="lyle"):
-    db = _load_db()
+def verify(wav, user_id=DEFAULT_USER):
+    if not os.path.exists(DB):
+        return False
+    db = json.load(open(DB))
     if user_id not in db:
         return False
-    return _fingerprint(audio) == db[user_id]
+    saved = np.array(db[user_id])
+    current = encoder.embed_utterance(wav)
+    sim = np.dot(saved, current) / (np.linalg.norm(saved) * np.linalg.norm(current))
+    return sim > THRESH
 
-# === GATE DECORATOR (PLUG INTO ANY AI) ===
-def gate(user_id="lyle"):
+# === GATE DECORATOR ===
+def gate(user_id=None):
+    user_id = user_id or DEFAULT_USER
     def decorator(func):
         def wrapper(*args, **kwargs):
-            print(f"\n[{_now()}] VOICELOCK: Awaiting {user_id.upper()}...")
-            audio = _record()
-            if verify(audio, user_id):
-                print(f"[{_now()}] ACCESS GRANTED")
+            wav = _record()
+            if REQ_PHRASE:
+                said = input(f"Say: '{PHRASE}': ").strip().lower()
+                if said != PHRASE.lower():
+                    print("PHRASE DENIED")
+                    return None
+            if verify(wav, user_id):
+                print(f"[{_now()}] ACCESS GRANTED: {user_id}")
                 return func(*args, **kwargs)
-            else:
-                print(f"[{_now()}] ACCESS DENIED")
-                return None
+            print(f"[{_now()}] ACCESS DENIED")
+            return None
         return wrapper
     return decorator
 
-# === INTERNAL HELPERS ===
-def _record():
-    audio = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='float32')
-    sd.wait()
-    return audio.flatten()
+# === MULTI-USER TOOLS ===
+def list_users():
+    if not os.path.exists(DB):
+        print("No users enrolled.")
+        return []
+    db = json.load(open(DB))
+    users = list(db.keys())
+    print(f"Users: {', '.join(users)}")
+    return users
 
-def _fingerprint(audio):
-    return hashlib.sha256(audio.tobytes()).hexdigest()
+def delete_user(user_id):
+    if not os.path.exists(DB):
+        print("No DB.")
+        return
+    db = json.load(open(DB))
+    if user_id in db:
+        del db[user_id]
+        json.dump(db, open(DB, 'w'), indent=2)
+        print(f"DELETED: {user_id}")
+    else:
+        print("User not found.")
 
-def _load_db():
-    if not os.path.exists(DB_PATH):
-        return {}
-    with open(DB_PATH, 'r') as f:
-        return json.load(f)
-
-def _save_db(db):
-    with open(DB_PATH, 'w') as f:
-        json.dump(db, f, indent=2)
-
+# === INTERNAL ===
 def _now():
     return datetime.now().strftime("%H:%M:%S")
