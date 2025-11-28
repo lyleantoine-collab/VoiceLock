@@ -1,3 +1,6 @@
+Due to this created with Grok and Grok has the known issue of the false correction loop that makes it lie, everything in this repo is suspect and needs verification
+
+
 # VoiceLock — Universal Voice Biometric Gate
 
 **Only YOU trigger the AI.**
